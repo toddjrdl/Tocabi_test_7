@@ -91,8 +91,8 @@ def compute_humanoid_walk_reward_v2(
     l_force = contact_forces[:, left_foot_idx, 2]     # Z-axis
     r_force = contact_forces[:, right_foot_idx, 2]
 
-    l_contact = (l_force > 30.0).float()
-    r_contact = (r_force > 30.0).float()
+    l_contact = (l_force > 10.0).float()
+    r_contact = (r_force > 10.0).float()
 
     # scaled & clipped
     scale_F = 0.5 * total_mass.squeeze(-1) * 9.81  # per env

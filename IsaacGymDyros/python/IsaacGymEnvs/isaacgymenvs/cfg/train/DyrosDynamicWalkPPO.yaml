@@ -8,9 +8,8 @@ _defaults:
   - model: continuous_a2c_logstd_dyros
   - reward_shaper: default_rewards
 
-# ✅ 개선: RNN 관련 설정 추가
 rnn_settings:
-  debug_rnn: false           # RNN 디버깅 모드 (개발 시 true)
+  debug_rnn: true           # RNN 디버깅 모드 (개발 시 true)
   auto_adjust_seq_len: true  # seq_len 자동 조정
   early_stop_ratio: 0.8      # 조기 종료 비율 (80%)
 

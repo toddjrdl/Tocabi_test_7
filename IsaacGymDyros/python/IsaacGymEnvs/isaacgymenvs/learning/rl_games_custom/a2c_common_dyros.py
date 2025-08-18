@@ -474,102 +474,79 @@ class A2CBase:
             self.mb_rnn_states = [torch.zeros((s.size()[0], num_seqs, s.size()[2]), dtype = torch.float32, device=self.ppo_device) for s in self.rnn_states]
 
     def init_rnn_from_model(self, model, reset_prev_data=True):
-        """완전히 재설계된 RNN 초기화 - 차원 일관성 확보"""
+        """✅ 더 안전한 RNN 초기화"""
         try:
             self.rnn_states = []
             self.rnn_dict = model.a2c_network.get_default_rnn_state()
             
-            print(f"[RNN-REDESIGN] 시작")
-            print(f"  seq_len: {self.seq_len}")
-            print(f"  horizon_length: {self.horizon_length}")
-            print(f"  num_actors: {getattr(self, 'num_actors', 'N/A')}")
+            print(f"[RNN-INIT] 안전한 초기화 시작")
             
             # 원본 RNN states 저장
             for i, state in enumerate(self.rnn_dict):
                 if isinstance(state, torch.Tensor):
                     state = state.contiguous().to(self.ppo_device)
                     self.rnn_states.append(state)
-                    print(f"  원본 RNN state {i}: {state.shape}")
+                    print(f"  RNN state {i}: {state.shape}")
             
             self.rnn_states_len = len(self.rnn_states)
             
+            # ✅ mb_rnn_states 생성 시 안전장치 추가
             if hasattr(self, 'num_actors') and hasattr(self, 'num_agents'):
                 batch_size = self.num_agents * self.num_actors
-                steps_per_batch = self.horizon_length // self.seq_len
                 
-                # ✅ 핵심: 두 가지 방법 중 선택
-                method = "unified_dimension"  # "unified_dimension" 또는 "simplified_mapping"
+                # 나누어떨어지는지 확인
+                if (self.horizon_length * batch_size) % self.seq_len != 0:
+                    print(f"[WARNING] 차원 불일치 감지, 자동 조정")
+                    # seq_len을 horizon_length의 약수로 조정
+                    for new_seq_len in [16, 8, 4, 2, 1]:
+                        if self.horizon_length % new_seq_len == 0:
+                            print(f"[AUTO-FIX] seq_len: {self.seq_len} → {new_seq_len}")
+                            self.seq_len = new_seq_len
+                            break
                 
-                if method == "unified_dimension":
-                    # 방법 1: 모든 텐서를 동일한 차원으로 통일
-                    total_sequences = batch_size * steps_per_batch
-                    print(f"  [METHOD 1] 통일 차원: {total_sequences}")
-                    
-                    # rnn_states를 확장하여 mb_rnn_states와 동일한 크기로 만듦
-                    self.expanded_rnn_states = []
-                    for s in self.rnn_states:
-                        # [1, batch_size, hidden] → [1, total_sequences, hidden]
-                        expanded = torch.zeros(
-                            s.size(0), total_sequences, s.size(2),
-                            device=s.device, dtype=s.dtype
-                        )
-                        # 각 actor의 상태를 모든 시퀀스에 복사
-                        for i in range(batch_size):
-                            start_idx = i * steps_per_batch
-                            end_idx = start_idx + steps_per_batch
-                            expanded[:, start_idx:end_idx, :] = s[:, i:i+1, :].expand(-1, steps_per_batch, -1)
-                        
-                        self.expanded_rnn_states.append(expanded)
-                        print(f"  확장된 rnn_state: {expanded.shape}")
-                    
-                    # mb_rnn_states도 동일한 크기로 설정
-                    self.mb_rnn_states = []
-                    for s in self.expanded_rnn_states:
-                        mb_state = torch.zeros_like(s)
-                        self.mb_rnn_states.append(mb_state)
-                    
-                    # 실제 사용할 rnn_states를 확장된 것으로 교체
-                    self.rnn_states = self.expanded_rnn_states
-                    
-                else:  # simplified_mapping
-                    # 방법 2: 단순화된 매핑 사용
-                    print(f"  [METHOD 2] 단순 매핑")
-                    self.mb_rnn_states = []
-                    for s in self.rnn_states:
-                        # 기존 방식 유지하되 안전장치 강화
-                        num_seqs = self.horizon_length * batch_size // self.seq_len
-                        mb_state = torch.zeros(
-                            (s.size(0), num_seqs, s.size(2)), 
-                            dtype=torch.float32, 
-                            device=self.ppo_device
-                        )
-                        self.mb_rnn_states.append(mb_state)
-                    
-                    # 특별한 플래그 설정
-                    self.use_simplified_rnn_mapping = True
-                    
+                num_seqs = self.horizon_length * batch_size // self.seq_len
+                
+                # mb_rnn_states 생성
+                self.mb_rnn_states = []
+                for s in self.rnn_states:
+                    mb_state = torch.zeros(
+                        (s.size(0), num_seqs, s.size(2)), 
+                        dtype=torch.float32, 
+                        device=self.ppo_device
+                    )
+                    self.mb_rnn_states.append(mb_state)
+                    print(f"  mb_rnn_state: {mb_state.shape}")
+                
+                print(f"[RNN-INIT] 초기화 완료")
+                
         except Exception as e:
-            print(f"[ERROR] RNN 재설계 실패: {e}")
+            print(f"[ERROR] RNN 초기화 실패: {e}")
+            # 실패 시 RNN 비활성화
+            self.is_rnn = False
+            print(f"[FALLBACK] RNN 모드 비활성화")
             raise
 
     def init_rnn_step(self, batch_size, mb_rnn_states):
-        """✅ 수정된 RNN 스텝 초기화 - 인덱스 안전성 강화"""
+        """✅ 안전한 RNN 스텝 초기화"""
         mb_rnn_states = self.mb_rnn_states
         
-        # ✅ 파라미터 검증
+        # 파라미터 검증
         if self.seq_len <= 0 or self.horizon_length <= 0 or batch_size <= 0:
-            raise ValueError(f"Invalid parameters: seq_len={self.seq_len}, "
-                           f"horizon_length={self.horizon_length}, batch_size={batch_size}")
+            raise ValueError(f"잘못된 파라미터: seq_len={self.seq_len}, "
+                        f"horizon_length={self.horizon_length}, batch_size={batch_size}")
         
-        # ✅ 나누어떨어지는지 확인
-        if (self.horizon_length * batch_size) % self.seq_len != 0:
-            print(f"[WARNING] (horizon_length * batch_size) % seq_len != 0")
-            print(f"  {self.horizon_length} * {batch_size} % {self.seq_len} = "
-                  f"{(self.horizon_length * batch_size) % self.seq_len}")
-        
+        # 나누어떨어지는지 확인 및 조정
         total_steps = self.horizon_length * batch_size
+        if total_steps % self.seq_len != 0:
+            print(f"[WARNING] seq_len 조정 필요")
+            # seq_len을 horizon_length의 약수로 조정
+            for new_seq_len in [8, 4, 2, 1]:
+                if self.horizon_length % new_seq_len == 0:
+                    print(f"[FIX] seq_len: {self.seq_len} → {new_seq_len}")
+                    self.seq_len = new_seq_len
+                    break
+            total_steps = self.horizon_length * batch_size
         
-        # ✅ 안전한 텐서 생성
         try:
             # 마스크 초기화
             mb_rnn_masks = torch.zeros(
@@ -578,21 +555,18 @@ class A2CBase:
                 device=self.ppo_device
             )
             
-            # 인덱스 텐서들 초기화 (범위 검증 포함)
+            # 안전한 인덱스 텐서들
             steps_mask = torch.arange(
                 0, total_steps, self.horizon_length, 
                 dtype=torch.long, device=self.ppo_device
             )
             
-            if steps_mask.size(0) != batch_size:
-                raise ValueError(f"steps_mask 크기 불일치: {steps_mask.size(0)} != {batch_size}")
-                
             play_mask = torch.arange(
                 0, batch_size, 1, 
                 dtype=torch.long, device=self.ppo_device
             )
             
-            # ✅ steps_state 안전한 계산
+            # steps_state 계산
             steps_per_seq = self.horizon_length // self.seq_len
             total_state_steps = batch_size * steps_per_seq
             
@@ -601,55 +575,79 @@ class A2CBase:
                 dtype=torch.long, device=self.ppo_device
             )
             
-            # ✅ indices 초기화
+            # indices 초기화
             indices = torch.zeros(
                 (batch_size,), 
                 dtype=torch.long, device=self.ppo_device
             )
             
+            print(f"[RNN-STEP] 텐서 생성 완료")
+            print(f"  total_steps: {total_steps}")
+            print(f"  batch_size: {batch_size}")
+            print(f"  seq_len: {self.seq_len}")
+            
         except Exception as e:
             print(f"[ERROR] RNN 텐서 초기화 실패: {e}")
-            print(f"  batch_size: {batch_size}")
-            print(f"  horizon_length: {self.horizon_length}")
-            print(f"  seq_len: {self.seq_len}")
-            print(f"  total_steps: {total_steps}")
             raise
-        
-        if self.debug_mode:
-            print(f"[RNN-STEP] 텐서 생성 완료:")
-            print(f"  mb_rnn_masks: {mb_rnn_masks.shape}")
-            print(f"  steps_mask: {steps_mask.shape}")
-            print(f"  play_mask: {play_mask.shape}")
-            print(f"  steps_state: {steps_state.shape}")
-            print(f"  indices: {indices.shape}")
         
         return mb_rnn_masks, indices, steps_mask, steps_state, play_mask, mb_rnn_states
 
-
     def process_rnn_indices(self, mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states):
-        """재설계된 RNN 인덱스 처리 - 안전하고 예측 가능"""
-        B = self.num_actors  
-        S = self.horizon_length // self.seq_len
-        N = B * S
+        """✅ 수정된 RNN 인덱스 처리 - 실제 상태 복사 포함"""
+        
+        # 기본 파라미터
+        B = self.num_actors  # 4096
         device = indices.device
-
-        print(f"[RNN-REDESIGN] B={B}, S={S}, N={N}")
-        print(f"[RNN-REDESIGN] indices: [{indices.min()}, {indices.max()}]")
         
-        # 현재 RNN state 크기 확인
-        if len(self.rnn_states) > 0:
-            rnn_size = self.rnn_states[0].size(1)
-            mb_size = self.mb_rnn_states[0].size(1)
-            print(f"[RNN-REDESIGN] rnn_size: {rnn_size}, mb_size: {mb_size}")
+        print(f"[RNN-PROCESS] B={B}, seq_len={self.seq_len}")
+        print(f"[RNN-PROCESS] indices 입력: [{indices.min().item()}, {indices.max().item()}]")
+        
+        # ✅ seq_indices 계산
+        seq_indices = torch.remainder(indices, self.seq_len)
+        
+        # 시작 프레임 감지 (seq_indices == 0인 위치)
+        start_mask = (seq_indices == 0)
+        
+        if start_mask.any():
+            state_indices = start_mask.nonzero(as_tuple=False).squeeze(-1)
+            print(f"[RNN-PROCESS] 시작 프레임 발견: {state_indices.numel()}개")
             
-            if rnn_size == mb_size:
-                print(f"[RNN-REDESIGN] 통일 차원 방식 사용")
-                return self._process_unified_dimension(indices, B, S, device)
-            else:
-                print(f"[RNN-REDESIGN] 단순 매핑 방식 사용")
-                return self._process_simplified_mapping(indices, B, S, device)
+            if state_indices.numel() > 0:
+                # ✅ 안전한 인덱스 클리핑
+                safe_indices = torch.clamp(state_indices, 0, B-1)
+                
+                # ✅ RNN 상태 복사 (DWL의 핵심!)
+                for li, layer_state in enumerate(self.rnn_states):
+                    if li < len(self.mb_rnn_states):
+                        try:
+                            # 범위 검사
+                            max_rnn_idx = layer_state.size(1) - 1
+                            max_mb_idx = self.mb_rnn_states[li].size(1) - 1
+                            
+                            # 안전한 범위 내에서만 복사
+                            valid_rnn_mask = safe_indices <= max_rnn_idx
+                            valid_mb_mask = state_indices <= max_mb_idx
+                            valid_mask = valid_rnn_mask & valid_mb_mask
+                            
+                            if valid_mask.any():
+                                valid_rnn_indices = safe_indices[valid_mask]
+                                valid_mb_indices = state_indices[valid_mask]
+                                
+                                source = layer_state[:, valid_rnn_indices, :]
+                                self.mb_rnn_states[li][:, valid_mb_indices, :] = source
+                                print(f"[SUCCESS] Layer {li} 복사 완료: {valid_mask.sum().item()}개")
+                            
+                        except Exception as e:
+                            print(f"[ERROR] Layer {li} 복사 실패: {e}")
+                            # 에러 발생 시 안전하게 0으로 초기화
+                            try:
+                                self.mb_rnn_states[li][:, state_indices, :] = 0.0
+                            except:
+                                pass
+        else:
+            print(f"[RNN-PROCESS] 시작 프레임 없음")
         
-        return torch.remainder(indices, self.seq_len), False
+        return seq_indices, False
 
     def _process_unified_dimension(self, indices, B, S, device):
         """통일 차원 방식의 RNN 처리"""

@@ -474,77 +474,66 @@ class A2CBase:
             self.mb_rnn_states = [torch.zeros((s.size()[0], num_seqs, s.size()[2]), dtype = torch.float32, device=self.ppo_device) for s in self.rnn_states]
 
     def init_rnn_from_model(self, model, reset_prev_data=True):
-        """✅ 수정된 RNN 초기화 - 메모리 안전성 강화"""
+        """✅ 완전히 수정된 RNN 초기화"""
         try:
             self.rnn_states = []
             self.rnn_dict = model.a2c_network.get_default_rnn_state()
             
-            if self.debug_mode:
-                print(f"[RNN-INIT] 초기화 시작")
-                print(f"  seq_len: {self.seq_len}")
-                print(f"  horizon_length: {self.horizon_length}")
-                print(f"  num_actors: {getattr(self, 'num_actors', 'N/A')}")
+            print(f"[RNN-INIT] 디버깅 정보:")
+            print(f"  seq_len: {self.seq_len}")
+            print(f"  horizon_length: {self.horizon_length}")
+            print(f"  num_actors: {getattr(self, 'num_actors', 'N/A')}")
+            print(f"  num_agents: {getattr(self, 'num_agents', 'N/A')}")
             
-            # ✅ CUDA 메모리 할당 안전성 확보
+            # CUDA 메모리 할당
             for i, state in enumerate(self.rnn_dict):
                 if isinstance(state, torch.Tensor):
-                    # GPU 메모리 사용량 체크
-                    if hasattr(torch.cuda, 'memory_allocated'):
-                        mem_before = torch.cuda.memory_allocated(self.ppo_device)
-                    
-                    # 메모리 연속성 보장 및 디바이스 일관성 체크
                     state = state.contiguous().to(self.ppo_device)
                     self.rnn_states.append(state)
-                    
-                    if self.debug_mode and hasattr(torch.cuda, 'memory_allocated'):
-                        mem_after = torch.cuda.memory_allocated(self.ppo_device)
-                        print(f"  RNN state {i}: {state.shape}, mem: +{(mem_after-mem_before)//1024//1024}MB")
+                    print(f"  RNN state {i}: {state.shape}")
             
             self.rnn_states_len = len(self.rnn_states)
             
-            # ✅ batch_size 계산 및 검증
+            # ✅ 핵심 수정: batch_size와 num_seqs 올바른 계산
             if hasattr(self, 'num_actors') and hasattr(self, 'num_agents'):
                 batch_size = self.num_agents * self.num_actors
-                num_seqs = self.horizon_length * batch_size // self.seq_len
                 
-                # 메모리 요구량 사전 계산
-                total_elements = sum(s.numel() for s in self.rnn_states) * num_seqs
-                estimated_mb = total_elements * 4 // 1024 // 1024  # float32 기준
+                # ✅ 중요: 올바른 num_seqs 계산
+                # 기존 잘못된 계산: num_seqs = self.horizon_length * batch_size // self.seq_len
+                # 올바른 계산: num_seqs = batch_size * (self.horizon_length // self.seq_len)
+                steps_per_batch = self.horizon_length // self.seq_len
+                num_seqs = batch_size * steps_per_batch
                 
-                if self.debug_mode:
-                    print(f"  batch_size: {batch_size}")
-                    print(f"  num_seqs: {num_seqs}")
-                    print(f"  estimated RNN memory: ~{estimated_mb}MB")
+                print(f"  batch_size: {batch_size}")
+                print(f"  steps_per_batch: {steps_per_batch}")
+                print(f"  num_seqs (수정됨): {num_seqs}")
                 
-                # ✅ 메모리 부족 예방
-                if estimated_mb > 2000:  # 2GB 초과시 경고
-                    print(f"[WARNING] RNN 메모리 요구량이 높음: {estimated_mb}MB")
-                    print(f"  num_envs 또는 horizon_length 줄이는 것을 권장")
+                # ✅ 검증: horizon_length가 seq_len로 나누어떨어지는지 확인
+                if self.horizon_length % self.seq_len != 0:
+                    raise ValueError(f"horizon_length({self.horizon_length})가 seq_len({self.seq_len})로 나누어떨어지지 않음")
                 
-                # ✅ mini-batch RNN states 생성 (안전하게)
+                # ✅ 검증: minibatch 설정 확인
+                total_steps = self.horizon_length * batch_size
+                if total_steps % self.num_minibatches != 0:
+                    print(f"[WARNING] total_steps({total_steps}) % num_minibatches({self.num_minibatches}) != 0")
+                
+                if (total_steps // self.num_minibatches) % self.seq_len != 0:
+                    print(f"[WARNING] minibatch_size가 seq_len로 나누어떨어지지 않음")
+                
+                # ✅ mb_rnn_states 올바른 생성
                 self.mb_rnn_states = []
                 for s in self.rnn_states:
-                    try:
-                        mb_state = torch.zeros(
-                            (s.size(0), num_seqs, s.size(2)), 
-                            dtype=torch.float32, 
-                            device=self.ppo_device
-                        )
-                        self.mb_rnn_states.append(mb_state)
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            print(f"[ERROR] GPU 메모리 부족으로 RNN 초기화 실패")
-                            print(f"  num_envs를 줄이거나 작은 GPU를 사용하세요")
-                            raise
-                        else:
-                            raise
-                            
+                    # 차원: [layer_dim, num_seqs, hidden_dim]
+                    mb_state = torch.zeros(
+                        (s.size(0), num_seqs, s.size(2)), 
+                        dtype=torch.float32, 
+                        device=self.ppo_device
+                    )
+                    self.mb_rnn_states.append(mb_state)
+                    print(f"  mb_rnn_state shape: {mb_state.shape}")
+                    
         except Exception as e:
             print(f"[ERROR] RNN 초기화 실패: {e}")
-            # 안전한 기본값으로 복구
-            self.rnn_states = []
-            self.rnn_states_len = 0
-            self.mb_rnn_states = []
             raise
 
     def init_rnn_step(self, batch_size, mb_rnn_states):
@@ -622,16 +611,21 @@ class A2CBase:
 
 
     def process_rnn_indices(self, mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states):
-        """✅ 수정된 RNN 인덱스 처리 - 범위 검증 강화"""
+        """✅ 완전히 수정된 RNN 인덱스 처리"""
         B = self.num_actors  
-        S = self.horizon_length // self.seq_len
-        N = B * S
+        S = self.horizon_length // self.seq_len  # steps_per_batch
+        N = B * S  # 총 시퀀스 수
         device = indices.device
 
-        # ✅ 입력 검증
-        if indices.max() >= self.seq_len * S:
-            print(f"[WARNING] indices 값이 너무 큼: max={indices.max()}, limit={self.seq_len * S}")
-            indices = torch.clamp(indices, 0, self.seq_len * S - 1)
+        print(f"[RNN-DEBUG] B={B}, S={S}, N={N}")
+        print(f"[RNN-DEBUG] indices 범위: [{indices.min()}, {indices.max()}]")
+        
+        # ✅ 1단계: 입력 검증 강화
+        max_allowed_index = self.seq_len * S - 1
+        if indices.max() > max_allowed_index:
+            print(f"[ERROR] indices 범위 초과: max={indices.max()}, allowed={max_allowed_index}")
+            indices = torch.clamp(indices, 0, max_allowed_index)
+            print(f"[FIX] indices 클리핑됨: [{indices.min()}, {indices.max()}]")
 
         # 시작 프레임 감지
         seq_indices = torch.remainder(indices, self.seq_len)
@@ -643,93 +637,101 @@ class A2CBase:
             self.last_state_indices = None
             return seq_indices, False
 
-        # ✅ 안전한 RNN 인덱스 계산
+        print(f"[RNN-DEBUG] state_indices 범위: [{state_indices.min()}, {state_indices.max()}]")
+        print(f"[RNN-DEBUG] state_indices count: {state_indices.numel()}")
+
+        # ✅ 2단계: 안전한 RNN 인덱스 계산
         try:
-            # 범위 검증을 위한 사전 계산
+            # actor별 시퀀스 ID 계산
             seq_id_per_actor = torch.div(indices, self.seq_len, rounding_mode='floor')
+            
+            # state_indices 범위 검증
+            if state_indices.numel() > 0 and state_indices.max() >= B:
+                print(f"[ERROR] state_indices 범위 초과: max={state_indices.max()}, B={B}")
+                state_indices = torch.clamp(state_indices, 0, B-1)
+            
+            # seq_id 범위 검증
+            selected_seq_ids = seq_id_per_actor[state_indices]
+            if selected_seq_ids.numel() > 0 and selected_seq_ids.max() >= S:
+                print(f"[ERROR] seq_id 범위 초과: max={selected_seq_ids.max()}, S={S}")
+                # 클리핑 대신 안전한 계산으로 수정
+                selected_seq_ids = torch.clamp(selected_seq_ids, 0, S-1)
+            
+            # ✅ 최종 rnn_indices 계산
             actor_ids = torch.arange(B, device=device, dtype=torch.long)
             actor_offsets = actor_ids * S
+            rnn_indices = actor_offsets[state_indices] + selected_seq_ids
             
-            # ✅ state_indices 범위 검증
-            if state_indices.numel() > 0:
-                max_state_idx = state_indices.max().item()
-                if max_state_idx >= B:
-                    print(f"[ERROR] state_indices 범위 초과: max={max_state_idx}, B={B}")
-                    state_indices = torch.clamp(state_indices, 0, B-1)
+            print(f"[RNN-DEBUG] rnn_indices 범위: [{rnn_indices.min()}, {rnn_indices.max()}]")
+            print(f"[RNN-DEBUG] N={N}")
             
-            # ✅ seq_id_per_actor 범위 검증
-            if seq_id_per_actor.numel() > 0:
-                max_seq_id = seq_id_per_actor[state_indices].max().item()
-                if max_seq_id >= S:
-                    print(f"[ERROR] seq_id 범위 초과: max={max_seq_id}, S={S}")
-                    seq_id_per_actor = torch.clamp(seq_id_per_actor, 0, S-1)
-            
-            rnn_indices = actor_offsets[state_indices] + seq_id_per_actor[state_indices]
-            
-            # ✅ 최종 인덱스 범위 검증
+            # ✅ 최종 범위 검증
             if rnn_indices.numel() > 0:
-                min_idx, max_idx = rnn_indices.min().item(), rnn_indices.max().item()
-                
-                if not (0 <= min_idx and max_idx < N):
-                    print(f"[ERROR] RNN 인덱스 범위 오류: [{min_idx}, {max_idx}] vs N={N}")
-                    print(f"  B={B}, S={S}, seq_len={self.seq_len}")
-                    print(f"  state_indices: {state_indices}")
-                    print(f"  seq_id_per_actor[state_indices]: {seq_id_per_actor[state_indices]}")
+                if rnn_indices.max() >= N:
+                    print(f"[ERROR] 최종 rnn_indices 범위 초과: max={rnn_indices.max()}, N={N}")
+                    print(f"  상세 정보:")
+                    print(f"    B={B}, S={S}, seq_len={self.seq_len}")
+                    print(f"    state_indices: {state_indices}")
+                    print(f"    selected_seq_ids: {selected_seq_ids}")
+                    print(f"    actor_offsets[state_indices]: {actor_offsets[state_indices]}")
                     
                     # 안전하게 클리핑
                     rnn_indices = torch.clamp(rnn_indices, 0, N-1)
+                    print(f"[FIX] rnn_indices 클리핑됨: [{rnn_indices.min()}, {rnn_indices.max()}]")
                     
         except Exception as e:
             print(f"[ERROR] RNN 인덱스 계산 실패: {e}")
             return seq_indices, False
 
-        # ✅ 안전한 RNN State 복사
+        # ✅ 3단계: 안전한 RNN State 복사
         try:
             for li, layer_state in enumerate(self.rnn_states):
                 if layer_state is None or rnn_indices.numel() == 0:
                     continue
                     
-                try:
-                    # 차원 검증
-                    if li < len(self.mb_rnn_states) and self.mb_rnn_states[li] is not None:
-                        # ✅ 인덱스 범위 재검증
-                        max_rnn_idx = rnn_indices.max().item()
-                        if max_rnn_idx >= layer_state.size(1):
-                            print(f"[ERROR] RNN layer {li} 인덱스 범위 초과: "
-                                  f"{max_rnn_idx} >= {layer_state.size(1)}")
-                            continue
-                        
-                        max_state_idx = state_indices.max().item()
-                        if max_state_idx >= self.mb_rnn_states[li].size(1):
-                            print(f"[ERROR] MB RNN layer {li} 인덱스 범위 초과: "
-                                  f"{max_state_idx} >= {self.mb_rnn_states[li].size(1)}")
-                            continue
-                        
-                        source_state = layer_state[:, rnn_indices, :]
-                        target_shape = self.mb_rnn_states[li][:, state_indices, :].shape
-                        
-                        # 모양 일치 확인
-                        if source_state.shape == target_shape:
-                            self.mb_rnn_states[li][:, state_indices, :] = source_state
-                        else:
-                            print(f"[WARNING] RNN state 모양 불일치 (layer {li}): "
-                                  f"{source_state.shape} vs {target_shape}")
-                            
-                except IndexError as idx_error:
-                    print(f"[ERROR] 인덱스 오류 (layer {li}): {idx_error}")
+                if li >= len(self.mb_rnn_states) or self.mb_rnn_states[li] is None:
+                    print(f"[ERROR] mb_rnn_states[{li}] 없음")
                     continue
-                except Exception as copy_error:
-                    print(f"[ERROR] RNN state 복사 실패 (layer {li}): {copy_error}")
+                
+                # ✅ 차원별 범위 검증
+                layer_state_dim1 = layer_state.size(1)  # 원본 상태의 두 번째 차원
+                mb_state_dim1 = self.mb_rnn_states[li].size(1)  # mb 상태의 두 번째 차원
+                
+                max_rnn_idx = rnn_indices.max().item() if rnn_indices.numel() > 0 else -1
+                max_state_idx = state_indices.max().item() if state_indices.numel() > 0 else -1
+                
+                print(f"[RNN-DEBUG] Layer {li}:")
+                print(f"  layer_state shape: {layer_state.shape}")
+                print(f"  mb_state shape: {self.mb_rnn_states[li].shape}")
+                print(f"  max_rnn_idx: {max_rnn_idx} (limit: {layer_state_dim1})")
+                print(f"  max_state_idx: {max_state_idx} (limit: {mb_state_dim1})")
+                
+                if max_rnn_idx >= layer_state_dim1:
+                    print(f"[ERROR] RNN layer {li} 인덱스 범위 초과: {max_rnn_idx} >= {layer_state_dim1}")
                     continue
+                
+                if max_state_idx >= mb_state_dim1:
+                    print(f"[ERROR] MB RNN layer {li} 인덱스 범위 초과: {max_state_idx} >= {mb_state_dim1}")
+                    continue
+                
+                # 실제 복사 수행
+                source_state = layer_state[:, rnn_indices, :]
+                target_slice = self.mb_rnn_states[li][:, state_indices, :]
+                
+                if source_state.shape == target_slice.shape:
+                    self.mb_rnn_states[li][:, state_indices, :] = source_state
+                    print(f"[SUCCESS] Layer {li} 복사 완료: {source_state.shape}")
+                else:
+                    print(f"[ERROR] Layer {li} 모양 불일치: {source_state.shape} vs {target_slice.shape}")
 
         except Exception as e:
             print(f"[ERROR] RNN state 처리 실패: {e}")
-            pass
 
         self.last_rnn_indices = rnn_indices if rnn_indices.numel() > 0 else None
         self.last_state_indices = state_indices if state_indices.numel() > 0 else None
         
         return seq_indices, False
+
     def process_rnn_dones(self, all_done_indices, indices, seq_indices):
         if len(all_done_indices) > 0:
             shifts = self.seq_len - 1 - seq_indices[all_done_indices]

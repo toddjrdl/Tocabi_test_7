@@ -157,4 +157,4 @@ params:
     # num_rewards: 14 #Modify with individual tasks 
     num_extra_logging: 12 #Modify with individual tasks
     separate_opt: True #True only when trying to study with separate actor/critic
-    debug_rnn: true # RNN 디버깅 모드
+    debug_rnn: true

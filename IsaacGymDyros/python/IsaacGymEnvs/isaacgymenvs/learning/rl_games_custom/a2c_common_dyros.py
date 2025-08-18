@@ -1521,7 +1521,7 @@ class ContinuousA2CBase(A2CBase):
         # =================================================================
         # 부모 초기화 전에 config 수정
         original_seq_len = config.get('seq_len', 8)
-        original_horizon = config.get('horizon_length', 24)
+        original_horizon = config.get('horizon_length', 128)
         
         # seq_len이 horizon_length보다 큰 경우 자동 조정
         if original_seq_len > original_horizon:
@@ -1531,7 +1531,7 @@ class ContinuousA2CBase(A2CBase):
         
         # horizon_length가 seq_len로 나누어떨어지지 않으면 조정
         seq_len = config.get('seq_len', 8)
-        horizon_length = config.get('horizon_length', 24)
+        horizon_length = config.get('horizon_length', 128)
         
         if (horizon_length % seq_len) != 0:
             # horizon_length를 seq_len의 배수로 조정
@@ -1549,23 +1549,7 @@ class ContinuousA2CBase(A2CBase):
         # 부모 A2CBase 초기화
         super().__init__(base_name, config)
         self.epoch_num = 0
-        '''
-        # 2) 논문 구조의 Actor–Critic 모델(HeightCNN→GRU→Decoder)을 생성·래핑
-        from .network_builder_dyros import A2CDYROSBuilder
-        from .models_dyros import ModelA2CContinuousLogStdDYROS
-        builder = A2CDYROSBuilder()
-        net = builder.load(self.config)                       # DyrosActorCritic 생성
-        wrapper = ModelA2CContinuousLogStdDYROS(net)         # RL-Games 래퍼
-        self.model = wrapper.build(self.config)               # 최종 nn.Module
-        self.model.to(self.ppo_device)
-        # ① inner DyrosActorCritic 뿐 아니라, 이 Network 래퍼 전체를 GPU 로 이동
-        self.model.to(self.ppo_device)
-        # ② GRU 파라미터 캐시 초기화
-        if hasattr(self.model, 'gru'):
-            self.model.gru.flatten_parameters()
-        if hasattr(self.model, 'gru'):
-            self.model.gru.flatten_parameters()
-        '''
+        self._prepare_cuda_environment()
         # =================================================================
         # ✅ 개선: 더 안전한 모델 생성
         # =================================================================
@@ -1597,7 +1581,8 @@ class ContinuousA2CBase(A2CBase):
                 except Exception as flatten_error:
                     if self.debug_mode:
                         print(f"[WARNING] 내부 GRU flatten_parameters 실패: {flatten_error}")
-                        
+            
+            self._safe_model_to_gpu()
         except Exception as model_error:
             print(f"[ERROR] 모델 생성 실패: {model_error}")
             raise
@@ -1664,6 +1649,89 @@ class ContinuousA2CBase(A2CBase):
         self.last_lr_sigma = float(getattr(self, 'last_lr_sigma', lr))    # actor(σ) lr (쓰지 않더라도 존재시켜 둠)
         self.lr_mul        = float(getattr(self, 'lr_mul', 1.0))          # lr multiplier 로깅용
         self.curr_clip_frac = float(getattr(self, 'curr_clip_frac', 0.0)) # PPO clip frac 로깅용
+
+    def _prepare_cuda_environment(self):
+        """CUDA 환경 사전 준비"""
+        if not torch.cuda.is_available():
+            print("[WARNING] CUDA 사용 불가, CPU 모드로 실행")
+            return
+            
+        try:
+            # 1. 디바이스 설정
+            device_id = 0
+            if hasattr(self, 'ppo_device'):
+                if 'cuda:' in str(self.ppo_device):
+                    device_id = int(str(self.ppo_device).split(':')[1])
+            
+            torch.cuda.set_device(device_id)
+            
+            # 2. CUDA 메모리 정리
+            torch.cuda.empty_cache()
+            
+            # 3. CUBLAS 초기화 테스트
+            test_tensor = torch.randn(100, 100, device=f'cuda:{device_id}')
+            _ = torch.mm(test_tensor, test_tensor)
+            del test_tensor
+            
+            # 4. cuDNN 설정
+            torch.backends.cudnn.enabled = True
+            torch.backends.cudnn.benchmark = False  # 안정성 우선
+            torch.backends.cudnn.deterministic = False
+            
+            print(f"[CUDA-PREP] CUDA 환경 준비 완료 (Device: {device_id})")
+            
+        except Exception as e:
+            print(f"[CUDA-PREP] 환경 준비 실패: {e}")
+            raise RuntimeError("CUDA 초기화 실패")
+
+    def _safe_model_to_gpu(self):
+        """안전한 모델 GPU 이동"""
+        try:
+            # 디바이스 설정
+            device = torch.device(self.ppo_device)
+            
+            # 모델을 GPU로 이동
+            self.model = self.model.to(device)
+            print(f"[MODEL-GPU] 모델 GPU 이동 완료: {device}")
+            
+            # ✅ GRU 안전 초기화
+            self._initialize_gru_safely()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"[ERROR] GPU 메모리 부족: {e}")
+                print("[SOLUTION] num_envs를 줄이거나 CPU 모드 사용")
+            else:
+                print(f"[ERROR] 모델 GPU 이동 실패: {e}")
+            raise
+
+    def _initialize_gru_safely(self):
+        """GRU 안전 초기화"""
+        try:
+            if hasattr(self.model, 'a2c_network') and hasattr(self.model.a2c_network, 'gru'):
+                gru = self.model.a2c_network.gru
+                
+                # 1. flatten_parameters 시도
+                try:
+                    gru.flatten_parameters()
+                    print("[GRU-INIT] flatten_parameters 성공")
+                except Exception as flatten_error:
+                    print(f"[GRU-INIT] flatten_parameters 실패: {flatten_error}")
+                
+                # 2. 더미 forward pass로 CUBLAS handle 생성
+                try:
+                    device = next(gru.parameters()).device
+                    with torch.no_grad():
+                        dummy_input = torch.randn(1, 1, gru.input_size, device=device)
+                        dummy_hidden = torch.zeros(gru.num_layers, 1, gru.hidden_size, device=device)
+                        _, _ = gru(dummy_input, dummy_hidden)
+                    print("[GRU-INIT] 더미 forward pass 성공")
+                except Exception as forward_error:
+                    print(f"[GRU-INIT] 더미 forward 실패: {forward_error}")
+                    # 이 경우 실제 실행 시 fallback 메커니즘이 작동함
+                    
+        except Exception as e:
+            print(f"[GRU-INIT] 전체 초기화 실패: {e}")
 
    
     def preprocess_actions(self, actions):

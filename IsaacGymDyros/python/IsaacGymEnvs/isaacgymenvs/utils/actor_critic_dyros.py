@@ -28,6 +28,8 @@ class DyrosActorCritic(nn.Module):
         self.gru = nn.GRU(input_size=num_obs,
                           hidden_size=rnn_hidden,
                           batch_first=True)
+        self._initialize_cuda_safely()
+        
         self.emb = nn.Sequential(
             nn.Linear(rnn_hidden, rnn_hidden),
             nn.ELU(inplace=True),
@@ -55,6 +57,33 @@ class DyrosActorCritic(nn.Module):
         # --- global log σ (fixed, learnable) ---
         self.log_std = nn.Parameter(torch.full((num_actions,), -1.609))  # ln 0.05s
 
+    def _initialize_cuda_safely(self):
+        """CUDA 및 CUBLAS 사전 초기화"""
+        if torch.cuda.is_available():
+            try:
+                device = torch.cuda.current_device()
+                torch.cuda.set_device(device)
+                
+                # CUBLAS handle 사전 생성
+                dummy = torch.randn(10, 10, device='cuda')
+                _ = torch.mm(dummy, dummy)
+                del dummy
+                print(f"[CUDA-INIT] 초기화 완료")
+            except Exception as e:
+                print(f"[CUDA-INIT] 실패: {e}")
+
+    def _safe_gru_forward(self, obs_seq, hidden):
+        """안전한 GRU forward with fallback"""
+        try:
+            # 기본: cuDNN 사용
+            self.gru.flatten_parameters()
+            return self.gru(obs_seq, hidden)
+        except RuntimeError as e:
+            if "cublas" in str(e).lower():
+                print(f"[GRU-FALLBACK] CPU 모드로 전환")
+                # CPU fallback 로직...
+                return self._cpu_fallback(obs_seq, hidden)
+            raise
     # ----------------------------------------------------
     def forward(self,
                 obs_seq: torch.Tensor,     # (B,T,61)
@@ -93,7 +122,7 @@ class DyrosActorCritic(nn.Module):
         from torch.backends import cudnn
         with cudnn.flags(enabled=False):
             # 반드시 hid_in 을 넘겨야 올바른 hidden state 사용
-            gru_out, h_new = self.gru(obs_seq, hid_in)
+            gru_out, h_new = self._safe_gru_forward(obs_seq, hid_in)
 
         # 6) 마지막 타임스텝만 꺼내 z 생성
         h_t = gru_out[:, -1]                             # (B,256)

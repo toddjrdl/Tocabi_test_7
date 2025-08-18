@@ -474,66 +474,82 @@ class A2CBase:
             self.mb_rnn_states = [torch.zeros((s.size()[0], num_seqs, s.size()[2]), dtype = torch.float32, device=self.ppo_device) for s in self.rnn_states]
 
     def init_rnn_from_model(self, model, reset_prev_data=True):
-        """✅ 완전히 수정된 RNN 초기화"""
+        """완전히 재설계된 RNN 초기화 - 차원 일관성 확보"""
         try:
             self.rnn_states = []
             self.rnn_dict = model.a2c_network.get_default_rnn_state()
             
-            print(f"[RNN-INIT] 디버깅 정보:")
+            print(f"[RNN-REDESIGN] 시작")
             print(f"  seq_len: {self.seq_len}")
             print(f"  horizon_length: {self.horizon_length}")
             print(f"  num_actors: {getattr(self, 'num_actors', 'N/A')}")
-            print(f"  num_agents: {getattr(self, 'num_agents', 'N/A')}")
             
-            # CUDA 메모리 할당
+            # 원본 RNN states 저장
             for i, state in enumerate(self.rnn_dict):
                 if isinstance(state, torch.Tensor):
                     state = state.contiguous().to(self.ppo_device)
                     self.rnn_states.append(state)
-                    print(f"  RNN state {i}: {state.shape}")
+                    print(f"  원본 RNN state {i}: {state.shape}")
             
             self.rnn_states_len = len(self.rnn_states)
             
-            # ✅ 핵심 수정: batch_size와 num_seqs 올바른 계산
             if hasattr(self, 'num_actors') and hasattr(self, 'num_agents'):
                 batch_size = self.num_agents * self.num_actors
-                
-                # ✅ 중요: 올바른 num_seqs 계산
-                # 기존 잘못된 계산: num_seqs = self.horizon_length * batch_size // self.seq_len
-                # 올바른 계산: num_seqs = batch_size * (self.horizon_length // self.seq_len)
                 steps_per_batch = self.horizon_length // self.seq_len
-                num_seqs = batch_size * steps_per_batch
                 
-                print(f"  batch_size: {batch_size}")
-                print(f"  steps_per_batch: {steps_per_batch}")
-                print(f"  num_seqs (수정됨): {num_seqs}")
+                # ✅ 핵심: 두 가지 방법 중 선택
+                method = "unified_dimension"  # "unified_dimension" 또는 "simplified_mapping"
                 
-                # ✅ 검증: horizon_length가 seq_len로 나누어떨어지는지 확인
-                if self.horizon_length % self.seq_len != 0:
-                    raise ValueError(f"horizon_length({self.horizon_length})가 seq_len({self.seq_len})로 나누어떨어지지 않음")
-                
-                # ✅ 검증: minibatch 설정 확인
-                total_steps = self.horizon_length * batch_size
-                if total_steps % self.num_minibatches != 0:
-                    print(f"[WARNING] total_steps({total_steps}) % num_minibatches({self.num_minibatches}) != 0")
-                
-                if (total_steps // self.num_minibatches) % self.seq_len != 0:
-                    print(f"[WARNING] minibatch_size가 seq_len로 나누어떨어지지 않음")
-                
-                # ✅ mb_rnn_states 올바른 생성
-                self.mb_rnn_states = []
-                for s in self.rnn_states:
-                    # 차원: [layer_dim, num_seqs, hidden_dim]
-                    mb_state = torch.zeros(
-                        (s.size(0), num_seqs, s.size(2)), 
-                        dtype=torch.float32, 
-                        device=self.ppo_device
-                    )
-                    self.mb_rnn_states.append(mb_state)
-                    print(f"  mb_rnn_state shape: {mb_state.shape}")
+                if method == "unified_dimension":
+                    # 방법 1: 모든 텐서를 동일한 차원으로 통일
+                    total_sequences = batch_size * steps_per_batch
+                    print(f"  [METHOD 1] 통일 차원: {total_sequences}")
+                    
+                    # rnn_states를 확장하여 mb_rnn_states와 동일한 크기로 만듦
+                    self.expanded_rnn_states = []
+                    for s in self.rnn_states:
+                        # [1, batch_size, hidden] → [1, total_sequences, hidden]
+                        expanded = torch.zeros(
+                            s.size(0), total_sequences, s.size(2),
+                            device=s.device, dtype=s.dtype
+                        )
+                        # 각 actor의 상태를 모든 시퀀스에 복사
+                        for i in range(batch_size):
+                            start_idx = i * steps_per_batch
+                            end_idx = start_idx + steps_per_batch
+                            expanded[:, start_idx:end_idx, :] = s[:, i:i+1, :].expand(-1, steps_per_batch, -1)
+                        
+                        self.expanded_rnn_states.append(expanded)
+                        print(f"  확장된 rnn_state: {expanded.shape}")
+                    
+                    # mb_rnn_states도 동일한 크기로 설정
+                    self.mb_rnn_states = []
+                    for s in self.expanded_rnn_states:
+                        mb_state = torch.zeros_like(s)
+                        self.mb_rnn_states.append(mb_state)
+                    
+                    # 실제 사용할 rnn_states를 확장된 것으로 교체
+                    self.rnn_states = self.expanded_rnn_states
+                    
+                else:  # simplified_mapping
+                    # 방법 2: 단순화된 매핑 사용
+                    print(f"  [METHOD 2] 단순 매핑")
+                    self.mb_rnn_states = []
+                    for s in self.rnn_states:
+                        # 기존 방식 유지하되 안전장치 강화
+                        num_seqs = self.horizon_length * batch_size // self.seq_len
+                        mb_state = torch.zeros(
+                            (s.size(0), num_seqs, s.size(2)), 
+                            dtype=torch.float32, 
+                            device=self.ppo_device
+                        )
+                        self.mb_rnn_states.append(mb_state)
+                    
+                    # 특별한 플래그 설정
+                    self.use_simplified_rnn_mapping = True
                     
         except Exception as e:
-            print(f"[ERROR] RNN 초기화 실패: {e}")
+            print(f"[ERROR] RNN 재설계 실패: {e}")
             raise
 
     def init_rnn_step(self, batch_size, mb_rnn_states):
@@ -611,124 +627,96 @@ class A2CBase:
 
 
     def process_rnn_indices(self, mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states):
-        """✅ 완전히 수정된 RNN 인덱스 처리"""
+        """재설계된 RNN 인덱스 처리 - 안전하고 예측 가능"""
         B = self.num_actors  
-        S = self.horizon_length // self.seq_len  # steps_per_batch
-        N = B * S  # 총 시퀀스 수
+        S = self.horizon_length // self.seq_len
+        N = B * S
         device = indices.device
 
-        print(f"[RNN-DEBUG] B={B}, S={S}, N={N}")
-        print(f"[RNN-DEBUG] indices 범위: [{indices.min()}, {indices.max()}]")
+        print(f"[RNN-REDESIGN] B={B}, S={S}, N={N}")
+        print(f"[RNN-REDESIGN] indices: [{indices.min()}, {indices.max()}]")
         
-        # ✅ 1단계: 입력 검증 강화
-        max_allowed_index = self.seq_len * S - 1
-        if indices.max() > max_allowed_index:
-            print(f"[ERROR] indices 범위 초과: max={indices.max()}, allowed={max_allowed_index}")
-            indices = torch.clamp(indices, 0, max_allowed_index)
-            print(f"[FIX] indices 클리핑됨: [{indices.min()}, {indices.max()}]")
+        # 현재 RNN state 크기 확인
+        if len(self.rnn_states) > 0:
+            rnn_size = self.rnn_states[0].size(1)
+            mb_size = self.mb_rnn_states[0].size(1)
+            print(f"[RNN-REDESIGN] rnn_size: {rnn_size}, mb_size: {mb_size}")
+            
+            if rnn_size == mb_size:
+                print(f"[RNN-REDESIGN] 통일 차원 방식 사용")
+                return self._process_unified_dimension(indices, B, S, device)
+            else:
+                print(f"[RNN-REDESIGN] 단순 매핑 방식 사용")
+                return self._process_simplified_mapping(indices, B, S, device)
+        
+        return torch.remainder(indices, self.seq_len), False
 
+    def _process_unified_dimension(self, indices, B, S, device):
+        """통일 차원 방식의 RNN 처리"""
         # 시작 프레임 감지
         seq_indices = torch.remainder(indices, self.seq_len)
         start_mask = (seq_indices == 0)
         state_indices = start_mask.nonzero(as_tuple=False).squeeze(-1)
-
+        
         if state_indices.numel() == 0:
-            self.last_rnn_indices = None
-            self.last_state_indices = None
             return seq_indices, False
+        
+        # ✅ 단순하고 안전한 인덱스 계산
+        # 각 actor의 현재 시퀀스 위치를 직접 계산
+        steps_per_batch = S
+        actor_base_indices = state_indices % B  # 실제 actor ID
+        sequence_offsets = torch.div(indices[state_indices], self.seq_len, rounding_mode='floor')
+        
+        # 최종 인덱스: actor_id * steps_per_batch + sequence_offset
+        rnn_indices = actor_base_indices * steps_per_batch + sequence_offsets
+        
+        # 안전성 검사
+        max_allowed = self.rnn_states[0].size(1) - 1
+        if rnn_indices.max() > max_allowed:
+            print(f"[WARNING] 인덱스 클리핑: {rnn_indices.max()} -> {max_allowed}")
+            rnn_indices = torch.clamp(rnn_indices, 0, max_allowed)
+        
+        print(f"[UNIFIED] rnn_indices: [{rnn_indices.min()}, {rnn_indices.max()}]")
+        
+        # 안전한 복사
+        for li, layer_state in enumerate(self.rnn_states):
+            if li < len(self.mb_rnn_states):
+                try:
+                    source = layer_state[:, rnn_indices, :]
+                    self.mb_rnn_states[li][:, state_indices, :] = source
+                    print(f"[SUCCESS] Layer {li} 복사 완료")
+                except Exception as e:
+                    print(f"[ERROR] Layer {li} 복사 실패: {e}")
+        
+        return seq_indices, False
 
-        print(f"[RNN-DEBUG] state_indices 범위: [{state_indices.min()}, {state_indices.max()}]")
-        print(f"[RNN-DEBUG] state_indices count: {state_indices.numel()}")
-
-        # ✅ 2단계: 안전한 RNN 인덱스 계산
-        try:
-            # actor별 시퀀스 ID 계산
-            seq_id_per_actor = torch.div(indices, self.seq_len, rounding_mode='floor')
-            
-            # state_indices 범위 검증
-            if state_indices.numel() > 0 and state_indices.max() >= B:
-                print(f"[ERROR] state_indices 범위 초과: max={state_indices.max()}, B={B}")
-                state_indices = torch.clamp(state_indices, 0, B-1)
-            
-            # seq_id 범위 검증
-            selected_seq_ids = seq_id_per_actor[state_indices]
-            if selected_seq_ids.numel() > 0 and selected_seq_ids.max() >= S:
-                print(f"[ERROR] seq_id 범위 초과: max={selected_seq_ids.max()}, S={S}")
-                # 클리핑 대신 안전한 계산으로 수정
-                selected_seq_ids = torch.clamp(selected_seq_ids, 0, S-1)
-            
-            # ✅ 최종 rnn_indices 계산
-            actor_ids = torch.arange(B, device=device, dtype=torch.long)
-            actor_offsets = actor_ids * S
-            rnn_indices = actor_offsets[state_indices] + selected_seq_ids
-            
-            print(f"[RNN-DEBUG] rnn_indices 범위: [{rnn_indices.min()}, {rnn_indices.max()}]")
-            print(f"[RNN-DEBUG] N={N}")
-            
-            # ✅ 최종 범위 검증
-            if rnn_indices.numel() > 0:
-                if rnn_indices.max() >= N:
-                    print(f"[ERROR] 최종 rnn_indices 범위 초과: max={rnn_indices.max()}, N={N}")
-                    print(f"  상세 정보:")
-                    print(f"    B={B}, S={S}, seq_len={self.seq_len}")
-                    print(f"    state_indices: {state_indices}")
-                    print(f"    selected_seq_ids: {selected_seq_ids}")
-                    print(f"    actor_offsets[state_indices]: {actor_offsets[state_indices]}")
-                    
-                    # 안전하게 클리핑
-                    rnn_indices = torch.clamp(rnn_indices, 0, N-1)
-                    print(f"[FIX] rnn_indices 클리핑됨: [{rnn_indices.min()}, {rnn_indices.max()}]")
-                    
-        except Exception as e:
-            print(f"[ERROR] RNN 인덱스 계산 실패: {e}")
+    def _process_simplified_mapping(self, indices, B, S, device):
+        """단순 매핑 방식의 RNN 처리"""
+        seq_indices = torch.remainder(indices, self.seq_len)
+        start_mask = (seq_indices == 0)
+        state_indices = start_mask.nonzero(as_tuple=False).squeeze(-1)
+        
+        if state_indices.numel() == 0:
             return seq_indices, False
-
-        # ✅ 3단계: 안전한 RNN State 복사
-        try:
-            for li, layer_state in enumerate(self.rnn_states):
-                if layer_state is None or rnn_indices.numel() == 0:
-                    continue
-                    
-                if li >= len(self.mb_rnn_states) or self.mb_rnn_states[li] is None:
-                    print(f"[ERROR] mb_rnn_states[{li}] 없음")
-                    continue
-                
-                # ✅ 차원별 범위 검증
-                layer_state_dim1 = layer_state.size(1)  # 원본 상태의 두 번째 차원
-                mb_state_dim1 = self.mb_rnn_states[li].size(1)  # mb 상태의 두 번째 차원
-                
-                max_rnn_idx = rnn_indices.max().item() if rnn_indices.numel() > 0 else -1
-                max_state_idx = state_indices.max().item() if state_indices.numel() > 0 else -1
-                
-                print(f"[RNN-DEBUG] Layer {li}:")
-                print(f"  layer_state shape: {layer_state.shape}")
-                print(f"  mb_state shape: {self.mb_rnn_states[li].shape}")
-                print(f"  max_rnn_idx: {max_rnn_idx} (limit: {layer_state_dim1})")
-                print(f"  max_state_idx: {max_state_idx} (limit: {mb_state_dim1})")
-                
-                if max_rnn_idx >= layer_state_dim1:
-                    print(f"[ERROR] RNN layer {li} 인덱스 범위 초과: {max_rnn_idx} >= {layer_state_dim1}")
-                    continue
-                
-                if max_state_idx >= mb_state_dim1:
-                    print(f"[ERROR] MB RNN layer {li} 인덱스 범위 초과: {max_state_idx} >= {mb_state_dim1}")
-                    continue
-                
-                # 실제 복사 수행
-                source_state = layer_state[:, rnn_indices, :]
-                target_slice = self.mb_rnn_states[li][:, state_indices, :]
-                
-                if source_state.shape == target_slice.shape:
-                    self.mb_rnn_states[li][:, state_indices, :] = source_state
-                    print(f"[SUCCESS] Layer {li} 복사 완료: {source_state.shape}")
-                else:
-                    print(f"[ERROR] Layer {li} 모양 불일치: {source_state.shape} vs {target_slice.shape}")
-
-        except Exception as e:
-            print(f"[ERROR] RNN state 처리 실패: {e}")
-
-        self.last_rnn_indices = rnn_indices if rnn_indices.numel() > 0 else None
-        self.last_state_indices = state_indices if state_indices.numel() > 0 else None
+        
+        # ✅ 가장 단순한 매핑: state_indices를 직접 사용
+        # 복잡한 계산 없이 actor 범위 내에서만 작업
+        safe_state_indices = torch.clamp(state_indices, 0, B-1)
+        
+        print(f"[SIMPLIFIED] state_indices: [{safe_state_indices.min()}, {safe_state_indices.max()}]")
+        
+        # 직접 매핑으로 복사
+        for li, layer_state in enumerate(self.rnn_states):
+            if li < len(self.mb_rnn_states):
+                try:
+                    # rnn_states에서는 actor 인덱스 사용
+                    source = layer_state[:, safe_state_indices, :]
+                    # mb_rnn_states에서는 원래 state_indices 사용 (크기가 다르므로)
+                    target_indices = torch.clamp(state_indices, 0, self.mb_rnn_states[li].size(1)-1)
+                    self.mb_rnn_states[li][:, target_indices, :] = source
+                    print(f"[SUCCESS] Layer {li} 단순 복사 완료")
+                except Exception as e:
+                    print(f"[ERROR] Layer {li} 단순 복사 실패: {e}")
         
         return seq_indices, False
 

@@ -8,6 +8,12 @@ _defaults:
   - model: continuous_a2c_logstd_dyros
   - reward_shaper: default_rewards
 
+# ✅ 개선: RNN 관련 설정 추가
+rnn_settings:
+  debug_rnn: false           # RNN 디버깅 모드 (개발 시 true)
+  auto_adjust_seq_len: true  # seq_len 자동 조정
+  early_stop_ratio: 0.8      # 조기 종료 비율 (80%)
+
 hydra:
   run:
     dir: ./runs/${task.name}
@@ -25,6 +31,11 @@ params:
     name: a2c_continuous
     #mini_epochs_num: 4
     gamma: 0.995 
+    horizon_length: 128
+    seq_len: 8
+
+    mini_epochs: 3
+    mini_batch_size: 4096 # DH: u may play with this (num_envs*horizon_length/mini_batch_size should be minibatch_size!!!!!!!!!!)
 
   reward_shaper:
     scale_value: 1.0
@@ -34,6 +45,8 @@ params:
     rnn_hidden: 256
     latent_dim: 24
     reg_loss_coef: 0.002
+
+    debug_rnn: ${...rnn_settings.debug_rnn} # RNN 디버깅 모드
 
   network:
     name: dyros_actor_critic
@@ -45,6 +58,8 @@ params:
       layers: 1
       before_mlp: false
       concat_input: true
+      dropout: 0.0
+      bidirectional: false
 
     space:
       continuous:
@@ -110,14 +125,14 @@ params:
     reward_shaper:
       scale_value: 1.0 
     normalize_advantage: True 
-    gamma: 0.99
+    gamma: 0.995
     tau: 0.95
     learning_rate: 1e-5
     learning_rate_min: 5e-6
     lr_schedule: linear # could be adaptive, linear, constant # DH: should be linear
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: ${resolve_default:20000,${....max_iterations}}   # DH: u may play with this # GENE: 80000000 / 16384 * 2
+    max_epochs: ${resolve_default:10000,${....max_iterations}}   # DH: u may play with this # GENE: 80000000 / 16384 * 2
     save_best_after: 200
     save_frequency: 100
     print_stats: True
@@ -133,12 +148,12 @@ params:
     critic_coef: 5
     policy_coef: 5
     clip_value: True
-    seq_len: 4
+    seq_len: 8
     bounds_loss_coef: 0.
     reg_loss_coef: 0.002
     #wandb
     wandb_activate: True # True, False
     log_wandb_frequency: 10
-    num_rewards: 14 #Modify with individual tasks 
+    # num_rewards: 14 #Modify with individual tasks 
     num_extra_logging: 12 #Modify with individual tasks
     separate_opt: True #True only when trying to study with separate actor/critic

@@ -477,45 +477,195 @@ class A2CBase:
         self.is_rnn = self.model.is_rnn()
 
     def init_rnn_step(self, batch_size, mb_rnn_states):
+        """
+        개선된 RNN 스텝 초기화: 더 안전한 텐서 생성
+        """
         mb_rnn_states = self.mb_rnn_states
-        mb_rnn_masks = torch.zeros(self.horizon_length*batch_size, dtype = torch.float32, device=self.ppo_device)
-        steps_mask = torch.arange(0, batch_size * self.horizon_length, self.horizon_length, dtype=torch.long, device=self.ppo_device)
-        play_mask = torch.arange(0, batch_size, 1, dtype=torch.long, device=self.ppo_device)
-        steps_state = torch.arange(0, batch_size * self.horizon_length//self.seq_len, self.horizon_length//self.seq_len, dtype=torch.long, device=self.ppo_device)
-        indices = torch.zeros((batch_size), dtype = torch.long, device=self.ppo_device)
+        
+        # =================================================================
+        # ✅ 개선: 더 안전한 텐서 초기화
+        # =================================================================
+        total_steps = self.horizon_length * batch_size
+        
+        # 마스크 초기화 (더 명시적)
+        mb_rnn_masks = torch.zeros(
+            total_steps, 
+            dtype=torch.float32, 
+            device=self.ppo_device
+        )
+        
+        # 인덱스 텐서들 초기화 (범위 검증 포함)
+        try:
+            steps_mask = torch.arange(
+                0, total_steps, self.horizon_length, 
+                dtype=torch.long, device=self.ppo_device
+            )
+            assert steps_mask.size(0) == batch_size, \
+                f"steps_mask 크기 불일치: {steps_mask.size(0)} != {batch_size}"
+                
+            play_mask = torch.arange(
+                0, batch_size, 1, 
+                dtype=torch.long, device=self.ppo_device
+            )
+            
+            steps_state = torch.arange(
+                0, batch_size * self.horizon_length // self.seq_len, 
+                self.horizon_length // self.seq_len, 
+                dtype=torch.long, device=self.ppo_device
+            )
+            
+            indices = torch.zeros(
+                (batch_size,), 
+                dtype=torch.long, device=self.ppo_device
+            )
+            
+        except Exception as e:
+            print(f"[ERROR] RNN 초기화 실패: {e}")
+            print(f"  batch_size: {batch_size}")
+            print(f"  horizon_length: {self.horizon_length}")
+            print(f"  seq_len: {self.seq_len}")
+            raise
+        
+        if self.debug_mode:
+            print(f"[RNN-INIT] Tensors created:")
+            print(f"  mb_rnn_masks: {mb_rnn_masks.shape}")
+            print(f"  steps_mask: {steps_mask.shape}")
+            print(f"  play_mask: {play_mask.shape}")
+            print(f"  steps_state: {steps_state.shape}")
+            print(f"  indices: {indices.shape}")
+        
         return mb_rnn_masks, indices, steps_mask, steps_state, play_mask, mb_rnn_states
 
     def process_rnn_indices(self, mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states):
         # 종료 조건
-        if indices.max().item() >= self.horizon_length:
+        # 개선: 대부분(80% 이상)이 도달했을 때만 종료
+        
+        num_finished = (indices >= self.horizon_length).sum().item()
+        total_envs = indices.numel()
+        finish_ratio = num_finished / total_envs
+        
+        # 80% 이상 완료되었거나, 모든 환경이 완료된 경우에만 종료
+        if finish_ratio >= 0.8 or num_finished == total_envs:
+            if self.debug_mode:  # 디버깅 로그 추가
+                print(f"[RNN] Early termination: {num_finished}/{total_envs} ({finish_ratio:.1%}) finished")
             return None, True
 
         # 콜렉션 마스크 갱신
+        # 완료되지 않은 환경들만 마스크 갱신
+        active_mask = (indices < self.horizon_length)
+        active_indices = indices[active_mask]
+        active_steps_mask = steps_mask[active_mask]
+        
+        if active_indices.numel() == 0:
+            return torch.remainder(indices, self.seq_len), False
+        
+        # 활성 환경들에 대해서만 마스크 설정
         if mb_rnn_masks.dtype != torch.float32:
             mb_rnn_masks = mb_rnn_masks.float()
-        mb_rnn_masks[indices + steps_mask] = 1
+        
+        mask_positions = active_indices + active_steps_mask
+        # 범위 체크 추가
+        valid_mask = mask_positions < mb_rnn_masks.size(0)
+        if valid_mask.any():
+            mb_rnn_masks[mask_positions[valid_mask]] = 1
 
         # 메타
         B = int(self.num_agents) * int(self.num_actors)  # 보통 env 수
         assert B == int(indices.numel()), f"batch 불일치: indices={indices.numel()} vs B={B}"
-        assert (self.horizon_length % self.seq_len) == 0, \
-            f"horizon({self.horizon_length}) % seq_len({self.seq_len}) != 0"
+
+        if (self.horizon_length % self.seq_len) != 0:
+            print(f"[RNN] 경고: horizon_length({self.horizon_length})가 seq_len({self.seq_len})의 배수가 아닙니다. ")
 
         S = self.horizon_length // self.seq_len         # 한 actor당 조각 수
         N = B * S                                       # 전체 조각 수
         device = indices.device
 
-        # 이번 스텝에서 '시작 프레임'(t % seq_len == 0)인 actor 선별
+        # 시작 프레임 감지
         seq_indices   = torch.remainder(indices, self.seq_len)      # (B,)
         start_mask    = (seq_indices == 0)
         state_indices = start_mask.nonzero(as_tuple=False).squeeze(-1)  # (N_start,)
 
-        # 시작하는 actor가 없으면 종료(대부분 step에서 정상)
         if state_indices.numel() == 0:
             self.last_rnn_indices   = None
             self.last_state_indices = None
             return seq_indices, False
+        # ✅ 개선 4: 더 안전한 RNN 인덱스 계산
+        # =================================================================
+        try:
+            # 활성 환경들의 원래 인덱스 매핑
+            active_env_ids = torch.arange(B, device=device)[active_mask]
+            original_state_indices = active_env_ids[state_indices]
+            
+            seq_id_per_actor = torch.div(active_indices, self.seq_len, rounding_mode='floor')
+            actor_offsets = original_state_indices * S
+            rnn_indices = actor_offsets + seq_id_per_actor[state_indices]
+            
+            # 범위 검증 강화
+            if rnn_indices.numel() > 0:
+                min_idx, max_idx = int(rnn_indices.min()), int(rnn_indices.max())
+                if not (0 <= min_idx and max_idx < N):
+                    print(f"[ERROR] rnn_indices 범위 오류: [{min_idx}, {max_idx}] vs N={N}")
+                    print(f"  active_indices: {active_indices}")
+                    print(f"  seq_id_per_actor: {seq_id_per_actor}")
+                    print(f"  state_indices: {state_indices}")
+                    # 오류 시 안전하게 처리
+                    return torch.remainder(indices, self.seq_len), False
+                    
+        except Exception as e:
+            print(f"[ERROR] RNN 인덱스 계산 실패: {e}")
+            return torch.remainder(indices, self.seq_len), False
 
+        # =================================================================
+        # ✅ 개선 5: 안전한 RNN State 복사
+        # =================================================================
+        try:
+            for li, (layer_state, layer_mb) in enumerate(zip(self.rnn_states, mb_rnn_states)):
+                # 기본 검증
+                if not (layer_state.dim() == 3 and layer_mb.dim() == 3):
+                    print(f"[ERROR] RNN state 차원 오류: state={layer_state.shape}, mb={layer_mb.shape}")
+                    continue
+                    
+                if layer_mb.size(1) != N:
+                    print(f"[ERROR] mb_rnn_states[{li}] 크기 불일치: {layer_mb.size(1)} != {N}")
+                    continue
+
+                # 배치 크기 확장 (안전하게)
+                if layer_state.size(1) == 1 and B > 1:
+                    s_expanded = layer_state.expand(layer_state.size(0), B, layer_state.size(2)).contiguous()
+                else:
+                    s_expanded = layer_state
+                    if s_expanded.size(1) not in (1, B):
+                        print(f"[WARNING] 예상치 못한 RNN state 배치 크기: {s_expanded.size(1)}")
+                        continue
+
+                # 안전한 슬라이싱과 복사
+                if state_indices.numel() > 0 and rnn_indices.numel() > 0:
+                    try:
+                        # 범위 내 인덱스만 복사
+                        valid_rnn_mask = (rnn_indices >= 0) & (rnn_indices < N)
+                        valid_state_mask = (original_state_indices >= 0) & (original_state_indices < B)
+                        
+                        valid_mask = valid_rnn_mask & valid_state_mask
+                        if valid_mask.any():
+                            valid_rnn_indices = rnn_indices[valid_mask]
+                            valid_state_indices = original_state_indices[valid_mask]
+                            layer_mb[:, valid_rnn_indices, :] = s_expanded[:, valid_state_indices, :]
+                            
+                    except Exception as copy_error:
+                        print(f"[ERROR] RNN state 복사 실패 (layer {li}): {copy_error}")
+                        continue
+
+        except Exception as e:
+            print(f"[ERROR] RNN state 처리 실패: {e}")
+            return torch.remainder(indices, self.seq_len), False
+
+        # 성공적으로 처리된 경우에만 저장
+        self.last_rnn_indices = rnn_indices if rnn_indices.numel() > 0 else None
+        self.last_state_indices = original_state_indices if state_indices.numel() > 0 else None
+        
+        return torch.remainder(indices, self.seq_len), False
+
+        '''
         # 각 actor의 조각 번호와 최종 시퀀스 인덱스 계산
         seq_id_per_actor = torch.div(indices, self.seq_len, rounding_mode='floor')  # (B,) in [0..S-1]
         actor_ids        = torch.arange(B, device=device, dtype=torch.long)         # (B,)
@@ -552,7 +702,7 @@ class A2CBase:
         self.last_rnn_indices   = rnn_indices
         self.last_state_indices = state_indices
         return seq_indices, False
-
+        '''
     def process_rnn_dones(self, all_done_indices, indices, seq_indices):
         if len(all_done_indices) > 0:
             shifts = self.seq_len - 1 - seq_indices[all_done_indices]
@@ -1342,12 +1492,47 @@ class ContinuousA2CBase(A2CBase):
     def __init__(self, base_name, config):
         if 'name' not in config:
             config['name'] = 'ContinuousA2CBase'
-        #A2CBase.__init__(self, base_name, config)
-        #self.model = config['network']
-        # 1) 먼저 부모 A2CBase 초기화
+        # =================================================================
+        # ✅ 개선: 디버그 모드 추가 (config에서 설정 가능)
+        # =================================================================
+        self.debug_mode = config.get('debug_rnn', False)
+        if self.debug_mode:
+            print(f"[RNN-DEBUG] 디버그 모드 활성화")
+        
+        # =================================================================
+        # ✅ 개선: 시퀀스 길이 호환성 체크 및 자동 조정
+        # =================================================================
+        # 부모 초기화 전에 config 수정
+        original_seq_len = config.get('seq_len', 8)
+        original_horizon = config.get('horizon_length', 24)
+        
+        # seq_len이 horizon_length보다 큰 경우 자동 조정
+        if original_seq_len > original_horizon:
+            config['seq_len'] = original_horizon
+            print(f"[AUTO-FIX] seq_len {original_seq_len} > horizon_length {original_horizon}")
+            print(f"           seq_len을 {config['seq_len']}로 자동 조정")
+        
+        # horizon_length가 seq_len로 나누어떨어지지 않으면 조정
+        seq_len = config.get('seq_len', 8)
+        horizon_length = config.get('horizon_length', 24)
+        
+        if (horizon_length % seq_len) != 0:
+            # horizon_length를 seq_len의 배수로 조정
+            adjusted_horizon = ((horizon_length // seq_len) + 1) * seq_len
+            print(f"[AUTO-FIX] horizon_length {horizon_length} % seq_len {seq_len} != 0")
+            print(f"           horizon_length를 {adjusted_horizon}로 자동 조정")
+            config['horizon_length'] = adjusted_horizon
+            
+            # algo 설정에도 반영 (YAML 구조에 따라)
+            if 'algo' in config:
+                config['algo']['horizon_length'] = adjusted_horizon
+            if 'config' in config:
+                config['config']['horizon_length'] = adjusted_horizon
+
+        # 부모 A2CBase 초기화
         super().__init__(base_name, config)
         self.epoch_num = 0
-
+        '''
         # 2) 논문 구조의 Actor–Critic 모델(HeightCNN→GRU→Decoder)을 생성·래핑
         from .network_builder_dyros import A2CDYROSBuilder
         from .models_dyros import ModelA2CContinuousLogStdDYROS
@@ -1363,15 +1548,84 @@ class ContinuousA2CBase(A2CBase):
             self.model.gru.flatten_parameters()
         if hasattr(self.model, 'gru'):
             self.model.gru.flatten_parameters()
-        # 3) RNN 사용 여부 플래그
-        self.is_rnn = getattr(self.model, 'is_rnn', False)
+        '''
+        # =================================================================
+        # ✅ 개선: 더 안전한 모델 생성
+        # =================================================================
+        try:
+            # 논문 구조의 Actor–Critic 모델(HeightCNN→GRU→Decoder)을 생성·래핑
+            from .network_builder_dyros import A2CDYROSBuilder
+            from .models_dyros import ModelA2CContinuousLogStdDYROS
+            
+            builder = A2CDYROSBuilder()
+            net = builder.load(self.config)                       # DyrosActorCritic 생성
+            wrapper = ModelA2CContinuousLogStdDYROS(net)         # RL-Games 래퍼
+            self.model = wrapper.build(self.config)               # 최종 nn.Module
+            
+            # GPU 이동
+            self.model.to(self.ppo_device)
+            
+            # GRU 파라미터 캐시 초기화 (안전하게)
+            if hasattr(self.model, 'gru'):
+                try:
+                    self.model.gru.flatten_parameters()
+                except Exception as flatten_error:
+                    if self.debug_mode:
+                        print(f"[WARNING] GRU flatten_parameters 실패: {flatten_error}")
+            
+            # 래퍼 내부 네트워크의 GRU도 초기화
+            if hasattr(self.model, 'a2c_network') and hasattr(self.model.a2c_network, 'gru'):
+                try:
+                    self.model.a2c_network.gru.flatten_parameters()
+                except Exception as flatten_error:
+                    if self.debug_mode:
+                        print(f"[WARNING] 내부 GRU flatten_parameters 실패: {flatten_error}")
+                        
+        except Exception as model_error:
+            print(f"[ERROR] 모델 생성 실패: {model_error}")
+            raise
+        
+        # RNN 사용 여부 플래그
+        self.is_rnn = getattr(self.model, 'is_rnn', lambda: False)()
+        if callable(self.is_rnn):
+            self.is_rnn = self.is_rnn()
+        
+        # RNN 관련 속성들 초기화
+        if self.is_rnn:
+            # 시퀀스 길이 설정 검증
+            final_seq_len = getattr(self, 'seq_len', config.get('seq_len', 8))
+            final_horizon = getattr(self, 'horizon_length', config.get('horizon_length', 24))
+            
+            if self.debug_mode:
+                print(f"[RNN-INIT] 최종 설정:")
+                print(f"  seq_len: {final_seq_len}")
+                print(f"  horizon_length: {final_horizon}")
+                print(f"  num_agents: {getattr(self, 'num_agents', 'N/A')}")
+                print(f"  num_actors: {getattr(self, 'num_actors', 'N/A')}")
+                
+                if hasattr(self, 'num_actors') and hasattr(self, 'num_agents'):
+                    batch_size = self.num_agents * self.num_actors
+                    print(f"  batch_size: {batch_size}")
+            
+            # RNN 상태 초기화는 나중에 init_rnn_from_model에서 처리됨
+        
+        # discrete 모드 비활성화
         self.is_discrete = False
+        
+        if self.debug_mode:
+            print(f"[RNN-INIT] ContinuousA2CBase 초기화 완료")
+            print(f"  is_rnn: {self.is_rnn}")
+            print(f"  is_discrete: {self.is_discrete}")
+            print(f"  model device: {next(self.model.parameters()).device}")
+
+
+        # 4) PPO 관련 설정
         action_space = self.env_info['action_space']
         self.actions_num = action_space.shape[0]
         self.bounds_loss_coef = config.get('bounds_loss_coef', None)
         #self.is_rnn = config.get('model', {}).get('rnn_hidden', 0) > 0
         self.clip_actions = config.get('clip_actions', True)
-
+        
         # todo introduce device instead of cuda()
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
